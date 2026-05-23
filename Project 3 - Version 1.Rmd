@@ -1,0 +1,253 @@
+---
+title: "The Effect of Beer Taxes on Traffic Fatalities"
+author: "Christopher Pellettiere, Alexander Acevedo, Brandon Kim"
+date: "June 5, 2026"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 6.5,
+  fig.height = 3.5
+)
+
+# Packages
+library(AER)
+library(plm)
+library(tidyverse)
+library(stargazer)
+library(lmtest)
+library(sandwich)
+library(car)
+library(kableExtra)
+```
+
+# Panel Data Model
+
+## Economic Question and Dataset
+
+This project investigates whether higher beer taxes are associated with lower traffic fatality rates across U.S. states over time. The main economic question is:
+
+**Do higher beer taxes reduce traffic fatalities?**
+
+This question is important because alcohol-related driving fatalities create large social costs, including loss of life, medical costs, property damage, and enforcement costs. If higher beer taxes are associated with fewer traffic fatalities, then alcohol taxation may be a useful public safety policy, not just a revenue-generating policy.
+
+The dataset used in this project is the `Fatalities` dataset from the `AER` package in R. The dataset is a balanced state-level panel that follows 48 U.S. states from 1982 to 1988, for a total of 336 state-year observations. The dependent variable is a traffic fatality rate, constructed as traffic fatalities per 10,000 people. The main explanatory variable of interest is the beer tax. Additional control variables include the minimum legal drinking age, income, miles driven, and population.
+
+Panel data is appropriate for this question because traffic fatality rates likely differ across states for persistent reasons that are difficult to fully observe. For example, states may differ in driving culture, rural road exposure, alcohol consumption norms, weather, law enforcement intensity, public transportation availability, road quality, and baseline attitudes toward drunk driving. These state-specific factors may affect traffic fatalities and may also be correlated with beer taxes or alcohol policies.
+
+Because of this, a pooled OLS model may suffer from omitted variable bias if it ignores unobserved state heterogeneity. A fixed effects model can control for time-invariant state characteristics by comparing each state to itself over time. A random effects model may be more efficient, but it requires the stronger assumption that the unobserved state-specific effects are uncorrelated with the explanatory variables. This project estimates pooled OLS, fixed effects, and random effects models, then uses formal statistical tests to determine the preferred specification.
+
+```{r part-a-panel-structure}
+data("Fatalities", package = "AER")
+
+fatalities_raw <- Fatalities
+
+fatalities_pd <- pdata.frame(
+  fatalities_raw,
+  index = c("state", "year")
+)
+
+num_states <- length(unique(fatalities_raw$state))
+num_years <- length(unique(fatalities_raw$year))
+num_obs <- nrow(fatalities_raw)
+balanced_status <- is.pbalanced(fatalities_pd)
+
+panel_structure <- data.frame(
+  `Number of States` = num_states,
+  `Number of Years` = num_years,
+  `Total Observations` = num_obs,
+  `Balanced Panel` = balanced_status
+)
+
+kable(
+  panel_structure,
+  caption = "Panel Structure of the Fatalities Dataset"
+)
+```
+
+## Summary Statistics and Panel Structure Visualizations
+
+```{r variable-construction}
+fatalities_pd <- fatalities_pd %>%
+  as.data.frame() %>%
+  mutate(
+    fatal_rate = fatal / pop * 10000,
+    log_income = log(income),
+    log_miles = log(miles),
+    log_pop = log(pop)
+  ) %>%
+  pdata.frame(index = c("state", "year"))
+```
+
+```{r summary-statistics}
+summary_stats <- fatalities_pd %>%
+  as.data.frame() %>%
+  select(fatal_rate, beertax, drinkage, log_income, log_miles, log_pop) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Variable",
+    values_to = "Value"
+  ) %>%
+  group_by(Variable) %>%
+  summarise(
+    Mean = mean(Value, na.rm = TRUE),
+    SD = sd(Value, na.rm = TRUE),
+    Min = min(Value, na.rm = TRUE),
+    Max = max(Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+summary_stats <- summary_stats %>%
+  mutate(
+    Variable = recode(
+      Variable,
+      "beertax" = "Beer Tax",
+      "drinkage" = "Minimum Drinking Age",
+      "fatal_rate" = "Fatality Rate",
+      "log_income" = "Log Income",
+      "log_miles" = "Log Miles Driven",
+      "log_pop" = "Log Population"
+    )
+  )
+
+kable(
+  summary_stats,
+  digits = 3,
+  caption = "Summary Statistics for Model Variables"
+)
+```
+
+Table 2 reports summary statistics for the variables used in the model. The average traffic fatality rate is 2.040 fatalities per 10,000 people, with values ranging from 0.821 to 4.218, showing meaningful variation across state-year observations. Beer taxes also vary substantially, with a mean of 0.513 and a range from 0.043 to 2.721. The minimum legal drinking age ranges from 18 to 21, which reflects policy variation across states and years. The income, miles, and population variables are logged to reduce the influence of large differences across states and to make the controls less skewed.
+
+```{r fatality-rate-over-time}
+ggplot(as.data.frame(fatalities_pd), aes(x = year, y = fatal_rate, group = state)) +
+  geom_line(alpha = 0.35) +
+  labs(
+    title = "Traffic Fatality Rates Across States Over Time",
+    x = "Year",
+    y = "Fatalities per 10,000 People"
+  )
+```
+**Figure 1: Traffic Fatality Rates Across States Over Time.**
+
+Figure 1 shows traffic fatality rates for each state from 1982 to 1988. The lines differ in their average levels, which suggests individual/state heterogeneity in fatality rates. There is also movement over time within states, meaning the dependent variable has both cross-sectional and time-series variation. This supports the use of panel methods and motivates testing whether pooled OLS is sufficient or whether state effects should be included.
+
+
+```{r beer-tax-over-time}
+ggplot(as.data.frame(fatalities_pd), aes(x = year, y = beertax, group = state)) +
+  geom_line(alpha = 0.35) +
+  labs(
+    title = "Beer Taxes Across States Over Time",
+    x = "Year",
+    y = "Beer Tax"
+  )
+```
+**Figure 2: Beer Taxes Across States Over Time.**  
+
+Figure 2 shows beer taxes for each state over time. Some states consistently have higher beer taxes than others, suggesting cross-state differences in alcohol tax policy. The graph also shows some within-state changes over time, although beer taxes are relatively stable for many states. This is important because the fixed effects model 
+identifies the effect of beer taxes using within-state changes over time.
+
+
+```{r beer-tax-fatality-scatter}
+ggplot(as.data.frame(fatalities_pd), aes(x = beertax, y = fatal_rate)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    title = "Beer Taxes and Traffic Fatality Rates",
+    x = "Beer Tax",
+    y = "Fatalities per 10,000 People"
+  )
+```
+**Figure 3: Pooled Relationship Between Beer Taxes and Traffic Fatality Rates.** 
+
+Figure 3 shows the pooled relationship between beer taxes and traffic fatality rates. The fitted line slopes upward, meaning that higher beer tax observations tend to be associated with higher fatality rates in the raw pooled data. This does not imply that beer taxes increase fatalities. Instead, it suggests that states with higher fatality risks may also have higher beer taxes or other state-specific characteristics. This motivates the use of fixed effects and random effects models to account for unobserved state heterogeneity.
+
+## Model Specification
+
+Before estimating the pooled, fixed effects, and random effects models, we use the following baseline specification:
+
+\[
+FatalRate_{it} = \beta_0 + \beta_1 BeerTax_{it} + \beta_2 DrinkAge_{it} + \beta_3 \log(Income_{it}) + \beta_4 \log(Miles_{it}) + \beta_5 \log(Population_{it}) + a_i + u_{it}
+\]
+
+where \(i\) indexes states and \(t\) indexes years.
+
+The dependent variable is \(FatalRate_{it}\), which measures traffic fatalities per 10,000 people in a given state and year. This is the outcome we are trying to explain because the project’s main question is whether alcohol taxation is associated with safer driving outcomes.
+
+The main independent variable of interest is \(BeerTax_{it}\), the beer tax in each state-year observation. We include this variable because beer taxes may reduce alcohol consumption, especially excessive alcohol consumption, which could reduce drunk driving and lower traffic fatalities. The expected sign on \(BeerTax_{it}\) is negative.
+
+The model also includes \(DrinkAge_{it}\), the minimum legal drinking age. This is included because legal access to alcohol may directly affect alcohol-related driving behavior, especially among younger drivers. The expected sign is negative because a higher drinking age should reduce access to alcohol for younger drivers and may lower fatality rates.
+
+We include \(\log(Income_{it})\) to control for state economic conditions. Income could affect fatality rates in more than one direction. Higher-income states may have safer cars, better roads, and stronger emergency response systems, which could reduce fatalities. However, higher income could also increase vehicle ownership and travel, which could increase accident exposure. Therefore, the expected sign is ambiguous.
+
+We include \(\log(Miles_{it})\) to control for driving exposure. States where residents drive more miles have more opportunities for accidents and fatalities to occur. The expected sign is positive.
+
+We include \(\log(Population_{it})\) to control for state size and differences between small and large states that may not be fully captured by the fatality rate. Since the dependent variable is already scaled by population, the expected sign is ambiguous.
+
+A simple pooled OLS model may be biased because there are likely unobserved state-specific factors that affect fatality rates and may also be correlated with beer taxes. These potential confounders include driving culture, rural road exposure, road quality, weather, law enforcement intensity, public transportation availability, alcohol consumption norms, and attitudes toward drunk driving. For example, states with higher baseline drunk-driving risk may choose higher beer taxes, which could make the raw relationship between beer taxes and fatalities appear positive even if beer taxes reduce fatalities within a state over time.
+
+The term \(a_i\) represents these unobserved state-specific factors that are constant over time. The fixed effects model controls for \(a_i\) by comparing each state to itself over time, while the random effects model assumes that \(a_i\) is uncorrelated with the regressors. The model-selection tests later in the report will help determine whether pooled OLS, fixed effects, or random effects is preferred.
+
+```{r variable-definition-table}
+variable_definitions <- data.frame(
+  Variable = c(
+    "Fatality Rate",
+    "Beer Tax",
+    "Minimum Drinking Age",
+    "Log Income",
+    "Log Miles Driven",
+    "Log Population"
+  ),
+  Role = c(
+    "Dependent variable",
+    "Main variable of interest",
+    "Control",
+    "Control",
+    "Control",
+    "Control"
+  ),
+  Reason = c(
+    "Measures traffic fatalities per 10,000 people",
+    "Tests whether alcohol taxation is associated with lower fatality rates",
+    "Controls for legal access to alcohol",
+    "Controls for state economic conditions",
+    "Controls for driving exposure",
+    "Controls for state size"
+  ),
+  `Expected Sign` = c(
+    "N/A",
+    "Negative",
+    "Negative",
+    "Ambiguous",
+    "Positive",
+    "Ambiguous"
+  )
+)
+
+kable(
+  variable_definitions,
+  caption = "Model Variables, Roles, and Expected Signs",
+  booktabs = TRUE,
+  escape = FALSE
+) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    font_size = 9
+  ) %>%
+  column_spec(1, width = "1.2in") %>%
+  column_spec(2, width = "1.3in") %>%
+  column_spec(3, width = "2.5in") %>%
+  column_spec(4, width = "1.0in")
+```
+
