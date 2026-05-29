@@ -1,0 +1,712 @@
+---
+title: "The Effect of Beer Taxes on Traffic Fatalities"
+author: "Christopher Pellettiere, Alexander Acevedo, Brandon Kim"
+date: "June 5, 2026"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 6.5,
+  fig.height = 3.5
+)
+
+# Packages
+library(AER)
+library(plm)
+library(tidyverse)
+library(stargazer)
+library(lmtest)
+library(sandwich)
+library(car)
+library(kableExtra)
+```
+
+# Panel Data Model
+
+## Economic Question and Dataset
+
+This project investigates whether higher beer taxes are associated with lower traffic fatality rates across U.S. states over time. The main economic question is:
+
+**Do higher beer taxes reduce traffic fatalities?**
+
+This question is important because alcohol-related driving fatalities create large social costs, including loss of life, medical costs, property damage, and enforcement costs. If higher beer taxes are associated with fewer traffic fatalities, then alcohol taxation may be a useful public safety policy, not just a revenue-generating policy.
+
+The dataset used in this project is the `Fatalities` dataset from the `AER` package in R. The dataset is a balanced state-level panel that follows 48 U.S. states from 1982 to 1988, for a total of 336 state-year observations. The dependent variable is a traffic fatality rate, constructed as traffic fatalities per 10,000 people. The main explanatory variable of interest is the beer tax. Additional control variables include the minimum legal drinking age, income, miles driven, and population.
+
+Panel data is appropriate for this question because traffic fatality rates likely differ across states for persistent reasons that are difficult to fully observe. For example, states may differ in driving culture, rural road exposure, alcohol consumption norms, weather, law enforcement intensity, public transportation availability, road quality, and baseline attitudes toward drunk driving. These state-specific factors may affect traffic fatalities and may also be correlated with beer taxes or alcohol policies.
+
+Because of this, a pooled OLS model may suffer from omitted variable bias if it ignores unobserved state heterogeneity. A fixed effects model can control for time-invariant state characteristics by comparing each state to itself over time. A random effects model may be more efficient, but it requires the stronger assumption that the unobserved state-specific effects are uncorrelated with the explanatory variables. This project estimates pooled OLS, fixed effects, and random effects models, then uses formal statistical tests to determine the preferred specification.
+
+```{r part-a-panel-structure}
+data("Fatalities", package = "AER")
+
+fatalities_raw <- Fatalities
+
+fatalities_pd <- pdata.frame(
+  fatalities_raw,
+  index = c("state", "year")
+)
+
+num_states <- length(unique(fatalities_raw$state))
+num_years <- length(unique(fatalities_raw$year))
+num_obs <- nrow(fatalities_raw)
+balanced_status <- is.pbalanced(fatalities_pd)
+
+panel_structure <- data.frame(
+  `Number of States` = num_states,
+  `Number of Years` = num_years,
+  `Total Observations` = num_obs,
+  `Balanced Panel` = balanced_status
+)
+
+kable(
+  panel_structure,
+  caption = "Panel Structure of the Fatalities Dataset"
+)
+```
+
+## Summary Statistics and Panel Structure Visualizations
+
+```{r variable-construction}
+fatalities_pd <- fatalities_pd %>%
+  as.data.frame() %>%
+  mutate(
+    fatal_rate = fatal / pop * 10000,
+    log_income = log(income),
+    log_miles = log(miles),
+    log_pop = log(pop)
+  ) %>%
+  pdata.frame(index = c("state", "year"))
+```
+
+```{r summary-statistics}
+summary_stats <- fatalities_pd %>%
+  as.data.frame() %>%
+  select(fatal_rate, beertax, drinkage, log_income, log_miles, log_pop) %>%
+  pivot_longer(
+    cols = everything(),
+    names_to = "Variable",
+    values_to = "Value"
+  ) %>%
+  group_by(Variable) %>%
+  summarise(
+    Mean = mean(Value, na.rm = TRUE),
+    SD = sd(Value, na.rm = TRUE),
+    Min = min(Value, na.rm = TRUE),
+    Max = max(Value, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+summary_stats <- summary_stats %>%
+  mutate(
+    Variable = recode(
+      Variable,
+      "beertax" = "Beer Tax",
+      "drinkage" = "Minimum Drinking Age",
+      "fatal_rate" = "Fatality Rate",
+      "log_income" = "Log Income",
+      "log_miles" = "Log Miles Driven",
+      "log_pop" = "Log Population"
+    )
+  )
+
+kable(
+  summary_stats,
+  digits = 3,
+  caption = "Summary Statistics for Model Variables"
+)
+```
+
+Table 2 reports summary statistics for the variables used in the model. The average traffic fatality rate is 2.040 fatalities per 10,000 people, with values ranging from 0.821 to 4.218, showing meaningful variation across state-year observations. Beer taxes also vary substantially, with a mean of 0.513 and a range from 0.043 to 2.721. The minimum legal drinking age ranges from 18 to 21, which reflects policy variation across states and years. The income, miles, and population variables are logged to reduce the influence of large differences across states and to make the controls less skewed.
+
+```{r fatality-rate-over-time}
+ggplot(as.data.frame(fatalities_pd), aes(x = year, y = fatal_rate, group = state)) +
+  geom_line(alpha = 0.35) +
+  labs(
+    title = "Traffic Fatality Rates Across States Over Time",
+    x = "Year",
+    y = "Fatalities per 10,000 People"
+  )
+```
+**Figure 1: Traffic Fatality Rates Across States Over Time.**
+
+Figure 1 shows traffic fatality rates for each state from 1982 to 1988. The lines differ in their average levels, which suggests individual/state heterogeneity in fatality rates. There is also movement over time within states, meaning the dependent variable has both cross-sectional and time-series variation. This supports the use of panel methods and motivates testing whether pooled OLS is sufficient or whether state effects should be included.
+
+
+```{r beer-tax-over-time}
+ggplot(as.data.frame(fatalities_pd), aes(x = year, y = beertax, group = state)) +
+  geom_line(alpha = 0.35) +
+  labs(
+    title = "Beer Taxes Across States Over Time",
+    x = "Year",
+    y = "Beer Tax"
+  )
+```
+**Figure 2: Beer Taxes Across States Over Time.**  
+
+Figure 2 shows beer taxes for each state over time. Some states consistently have higher beer taxes than others, suggesting cross-state differences in alcohol tax policy. The graph also shows some within-state changes over time, although beer taxes are relatively stable for many states. This is important because the fixed effects model 
+identifies the effect of beer taxes using within-state changes over time.
+
+
+```{r beer-tax-fatality-scatter}
+ggplot(as.data.frame(fatalities_pd), aes(x = beertax, y = fatal_rate)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(
+    title = "Beer Taxes and Traffic Fatality Rates",
+    x = "Beer Tax",
+    y = "Fatalities per 10,000 People"
+  )
+```
+**Figure 3: Pooled Relationship Between Beer Taxes and Traffic Fatality Rates.** 
+
+Figure 3 shows the pooled relationship between beer taxes and traffic fatality rates. The fitted line slopes upward, meaning that higher beer tax observations tend to be associated with higher fatality rates in the raw pooled data. This does not imply that beer taxes increase fatalities. Instead, it suggests that states with higher fatality risks may also have higher beer taxes or other state-specific characteristics. This motivates the use of fixed effects and random effects models to account for unobserved state heterogeneity.
+
+## Model Specification
+
+Before estimating the pooled, fixed effects, and random effects models, we use the following baseline specification:
+
+$FatalRate_{it} = \beta_0 + \beta_1 BeerTax_{it} + \beta_2 DrinkAge_{it} + \beta_3 \log(Income_{it}) + \beta_4 \log(Miles_{it}) + \beta_5 \log(Population_{it}) + a_i + u_{it}$
+
+where $i$ indexes states and $t$ indexes years.
+
+The dependent variable is $FatalRate_{it}$, which measures traffic fatalities per 10,000 people in a given state and year. This is the outcome we are trying to explain because the project’s main question is whether alcohol taxation is associated with safer driving outcomes.
+
+The main independent variable of interest is $BeerTax_{it}$, the beer tax in each state-year observation. We include this variable because beer taxes may reduce alcohol consumption, especially excessive alcohol consumption, which could reduce drunk driving and lower traffic fatalities. The expected sign on $BeerTax_{it}$ is negative.
+
+The model also includes $DrinkAge_{it}$, the minimum legal drinking age. This is included because legal access to alcohol may directly affect alcohol-related driving behavior, especially among younger drivers. The expected sign is negative because a higher drinking age should reduce access to alcohol for younger drivers and may lower fatality rates.
+
+We include $\log(Income_{it})$ to control for state economic conditions. Income could affect fatality rates in more than one direction. Higher-income states may have safer cars, better roads, and stronger emergency response systems, which could reduce fatalities. However, higher income could also increase vehicle ownership and travel, which could increase accident exposure. Therefore, the expected sign is ambiguous.
+
+We include $\log(Miles_{it})$ to control for driving exposure. States where residents drive more miles have more opportunities for accidents and fatalities to occur. The expected sign is positive.
+
+We include $\log(Population_{it})$ to control for state size and differences between small and large states that may not be fully captured by the fatality rate. Since the dependent variable is already scaled by population, the expected sign is ambiguous.
+
+A simple pooled OLS model may be biased because there are likely unobserved state-specific factors that affect fatality rates and may also be correlated with beer taxes. These potential confounders include driving culture, rural road exposure, road quality, weather, law enforcement intensity, public transportation availability, alcohol consumption norms, and attitudes toward drunk driving. For example, states with higher baseline drunk-driving risk may choose higher beer taxes, which could make the raw relationship between beer taxes and fatalities appear positive even if beer taxes reduce fatalities within a state over time.
+
+The term $a_i$ represents these unobserved state-specific factors that are constant over time. The fixed effects model controls for $a_i$ by comparing each state to itself over time, while the random effects model assumes that $a_i$ is uncorrelated with the regressors. The model-selection tests later in the report will help determine whether pooled OLS, fixed effects, or random effects is preferred.
+
+```{r variable-definition-table}
+variable_definitions <- data.frame(
+  Variable = c(
+    "Fatality Rate",
+    "Beer Tax",
+    "Minimum Drinking Age",
+    "Log Income",
+    "Log Miles Driven",
+    "Log Population"
+  ),
+  Role = c(
+    "Dependent variable",
+    "Main variable of interest",
+    "Control",
+    "Control",
+    "Control",
+    "Control"
+  ),
+  Reason = c(
+    "Measures traffic fatalities per 10,000 people",
+    "Tests whether alcohol taxation is associated with lower fatality rates",
+    "Controls for legal access to alcohol",
+    "Controls for state economic conditions",
+    "Controls for driving exposure",
+    "Controls for state size"
+  ),
+  `Expected Sign` = c(
+    "N/A",
+    "Negative",
+    "Negative",
+    "Ambiguous",
+    "Positive",
+    "Ambiguous"
+  )
+)
+
+kable(
+  variable_definitions,
+  caption = "Model Variables, Roles, and Expected Signs",
+  booktabs = TRUE,
+  escape = FALSE
+) %>%
+  kable_styling(
+    latex_options = c("hold_position"),
+    font_size = 9
+  ) %>%
+  column_spec(1, width = "1.2in") %>%
+  column_spec(2, width = "1.3in") %>%
+  column_spec(3, width = "2.5in") %>%
+  column_spec(4, width = "1.0in")
+```
+
+## Estimation of Panel Data Models
+
+To examine the statistical relationship between beer taxes and traffic fatality rates (as defined above), we estimate three separate panel data specifications: (i) Pooled OLS, (ii) Fixed Effects (FE), and (iii) Random Effects (RE). Each model treats unobserved state-specific heterogeneity differently. Hence, comparing the results across models will help determine whether controlling for unobserved state (time-invariant) characteristics meaningfully changes the estimated effect of beer taxes on traffic fatalities.
+
+### Pooled OLS Model
+
+First, the pooled OLS model treats the panel dataset as a single combined sample and ignores potential unobserved state-specific effects. In other words, it assumes that any such unobserved heterogeneity across states is either negligible or uncorrelated with the explanatory variables (i.e., $\alpha_i = 0$). As such, the intercept and slope coefficients are constant (identical) for all states and time periods, which may not make sense from an economic and statistical viewpoint.
+
+```{r pooled-model-estimation}
+pool_model <- plm(
+  fatal_rate ~ beertax + drinkage + log_income + log_miles + log_pop,
+  data = fatalities_pd,
+  model = "pooling"
+)
+summary(pool_model)
+```
+
+```{r pooled-model-table}
+pool_results <- broom::tidy(pool_model)
+
+pool_results <- pool_results %>%
+  mutate(
+    term = recode(
+      term,
+      "(Intercept)" = "Constant",
+      "beertax" = "Beer Tax",
+      "drinkage" = "Minimum Drinking Age",
+      "log_income" = "Log Income",
+      "log_miles" = "Log Miles Driven",
+      "log_pop" = "Log Population"
+    )
+  ) %>%
+  select(
+    Variable = term,
+    Estimate = estimate,
+    `Std. Error` = std.error,
+    `t-Statistic` = statistic,
+    `P-Value` = p.value
+  )
+
+kable(
+  pool_results,
+  digits = 3,
+  caption = "Pooled OLS Model Results"
+)
+```
+
+Table 4 reports the pooled OLS estimation results for the relationship between beer taxes and traffic fatality rates. Under this specification, the estimated coefficient on $BeerTax$ is positive (0.050), suggesting that higher beer taxes are associated with slightly higher traffic fatality rates in the pooled data. However, the coefficient is not statistically significant ($p = 0.3716$), meaning there is insufficient evidence to conclude that beer taxes have a measurable effect on fatality rates in the pooled OLS model.
+
+Among the control variables, $\log({Income})$ and $\log({Miles})$ are both statistically significant at the 1% level. In particular, higher income is associated with lower fatality rates (coefficient of -1.551), while higher driving exposure is associated with higher fatality rates (coefficient of 1.622), which is consistent with our expectation that states where residents drive more miles face greater accident risk. Neither $DrinkAge$ nor $\log({Population})$ are statistically significant in this specification.
+
+In addition, the pooled model has an $R^2$ of 0.46, indicating that approximately 46% of the variation in traffic fatality rates can be explained by the included regressors. However, the model likely suffers from omitted variable bias because it ignores unobserved state-specific characteristics such as driving culture, road quality, weather conditions, law enforcement intensity, and attitudes toward drunk driving. If these unobserved factors are correlated with beer taxes or other regressors, then the provided estimates may be biased and inconsistent. For this reason, the fixed effects and random effects models are estimated next to account for unobserved heterogeneity across states.
+
+### Fixed Effects Model (FEM)
+
+Second, the fixed effects model algebraically controls for unobserved, time-invariant state characteristics through _demeaning_, which also allows each state to have its own intercept (and also allows $Cov(\alpha_i, X_{it}) \neq 0$). Unlike pooled OLS, the FEM removes the influence of all state-specific factors that do not change over time, such as geography (i.e., rural vs urban density) and persistent differences in road infrastructure. Thus, this model estimates the effect of beer taxes using _within-state_ (not between) changes over time. 
+
+```{r fixed-effects-estimation}
+fe_model <- plm(
+  fatal_rate ~ beertax + drinkage + log_income + log_miles + log_pop,
+  data = fatalities_pd,
+  model = "within"
+)
+summary(fe_model)
+```
+
+```{r fixed-effects-table}
+fe_results <- broom::tidy(fe_model)
+
+fe_results <- fe_results %>%
+  mutate(
+    term = recode(
+      term,
+      "beertax" = "Beer Tax",
+      "drinkage" = "Minimum Drinking Age",
+      "log_income" = "Log Income",
+      "log_miles" = "Log Miles Driven",
+      "log_pop" = "Log Population"
+    )
+  ) %>%
+  select(
+    Variable = term,
+    Estimate = estimate,
+    `Std. Error` = std.error,
+    `t-Statistic` = statistic,
+    `P-Value` = p.value
+  )
+
+kable(
+  fe_results,
+  digits = 3,
+  caption = "Fixed Effects Model Results"
+)
+```
+
+As displayed above, Table 5 reports the fixed effects estimation results. To reiterate, the FEM controls for unobserved time-invariant state characteristics by comparing each state to itself over time, thereby removing the influence of persistent state-specific factors such as driving culture, geographic conditions, and road infrastructure that may be correlated with $BeerTax$ or other regressors. Critically, this means that the FEM eliminates any omitted variable bias from _time-invariant_ factors, as well as the constant intercept ($\beta_0$) we saw in pooled OLS.
+
+Under the FEM, the estimated coefficient on $BeerTax$ is negative (-0.314), consistent with our hypothesis that higher beer taxes reduce traffic fatality rates. In addition, the coefficient is statistically significant at the 10% level ($p = 0.096$), but not at the 5% level, suggesting moderate evidence that increases in beer taxes are associated with lower fatality rates _within_ states over time. This result differs substantially from the pooled OLS model, where the beer tax coefficient was positive and statistically insignificant. From a statistical standpoint, the change in sign suggests that unobserved state heterogeneity may have biased the earlier pooled OLS estimates.
+
+Further, the coefficient on $DrinkAge$ is negative and statistically significant at the 5% level, indicating that increases in the legal drinking age are associated with lower traffic fatality rates. Likewise, $\log({Population})$'s coefficient is also statistically significant and negative, while that for $\log({Income})$ is positive and statistically significant. Unlike in the pooled OLS model, the coefficient on $\log({Miles})$ is not statistically significant after controlling for state fixed effects.
+
+The FEM has an $R^2$ of 0.165, meaning that approximately 16.5% of the within-state variation in traffic fatality rates is explained by the regressors. Although the within $R^2$ is lower than the pooled OLS $R^2$, the fixed effects estimator is still  more credible when unobserved state-specific effects are correlated with the explanatory variables.
+
+### Random Effects Model (REM)
+
+Finally, the random effects model accounts for unobserved state-specific heterogeneity while assuming that such unobserved state effects are _uncorrelated_ with the explanatory variables (i.e., $Cov(\alpha_i, X_{it}) = 0$), which is often an unrealistic assumption. Unlike the fixed effects model, the REM treats any heterogeneity as part of the error term ($u_{it}$) and thus uses both within-state and between-state variation. To be more specific, the REM assumes each state's intercept differs randomly from the population average, i.e., $\beta_{0i} = \bar{\beta_0} + u_i$ If assumptions hold, the random effects estimators can be more efficient. 
+
+```{r random-effects-estimation}
+re_model <- plm(
+  fatal_rate ~ beertax + drinkage + log_income + log_miles + log_pop,
+  data = fatalities_pd,
+  model = "random"
+)
+summary(re_model)
+```
+
+```{r random-effects-table}
+re_results <- broom::tidy(re_model)
+
+re_results <- re_results %>%
+  mutate(
+    term = recode(
+      term,
+      "(Intercept)" = "Constant",
+      "beertax" = "Beer Tax",
+      "drinkage" = "Minimum Drinking Age",
+      "log_income" = "Log Income",
+      "log_miles" = "Log Miles Driven",
+      "log_pop" = "Log Population"
+    )
+  ) %>%
+  select(
+    Variable = term,
+    Estimate = estimate,
+    `Std. Error` = std.error,
+    `t-Statistic` = statistic,
+    `P-Value` = p.value
+  )
+
+kable(
+  re_results,
+  digits = 3,
+  caption = "Random Effects Model Results"
+)
+```
+
+Table 6 reports the random effects estimation results. Under this final specification, the estimated coefficient on $BeerTax$ is positive (0.188) and statistically significant at the 10% level ($p = 0.098$), once again suggesting moderate evidence that higher beer taxes are associated with higher traffic fatality rates. This result differs from the fixed effects model, where the beer tax coefficient was negative (but still significant). Critically, the difference between the fixed and random effects estimates could indicate that the assumption underlying the random effects model, namely, $Cov(\alpha_i, X_{it}) = 0$, may not hold in this application.
+
+Among the control variables, the slope coefficient on $\log{(Miles)}$  is positive and statistically significant at the 5% level, indicating that states with greater driving exposure tend to experience higher fatality rates in the REM. Also, the coefficient on $\log{(Population)}$ is negative and statistically significant, while the coefficient on $\log{(Income)}$ is positive and marginally significant at the 10% level. $DrinkAge$ is not statistically significant in the random effects specification.
+
+Further, the REM has an $R^2$ of 0.075, indicating that the model explains approximately 7.5% of the variation in traffic fatality rates. Because the validity of the random effects estimator depends on the assumption that unobserved state effects are uncorrelated with the regressors, a formal Hausman test will later be used to compare the fixed and random effects specifications and determine the more appropriate model.
+
+### Comparative Table of Panel Results
+
+Below, we summarize our findings thus far in a single comparative table displaying all three models side-by-side, including slope coefficients and qualitative considerations.
+
+\newpage
+
+```{r comparative-regression-table}
+# Default (non-robust) standard errors
+pool_se <- sqrt(diag(vcov(pool_model)))
+fe_se   <- sqrt(diag(vcov(fe_model)))
+re_se   <- sqrt(diag(vcov(re_model)))
+
+# Function for significance stars (now based on classical SEs)
+starify <- function(coef, pval) {
+  stars <- ifelse(pval < 0.01, "***",
+           ifelse(pval < 0.05, "**",
+           ifelse(pval < 0.10, "*", "")))
+  
+  paste0(sprintf("%.3f", coef), stars)
+}
+
+# Classical (non-robust) p-values
+pool_p <- coeftest(pool_model, vcov = vcov(pool_model))[,4]
+fe_p   <- coeftest(fe_model,   vcov = vcov(fe_model))[,4]
+re_p   <- coeftest(re_model,   vcov = vcov(re_model))[,4]
+
+comparison_table <- data.frame(
+  Variable = c(
+    "Beer Tax", "",
+    "Drinking Age", "",
+    "Log Income", "",
+    "Log Miles", "",
+    "Log Population", "",
+    "Constant", "",
+    "R-Squared",
+    "State Fixed Effects?",
+    "Random Effects?"
+  ),
+
+  `Pooled OLS` = c(
+    starify(coef(pool_model)["beertax"], pool_p["beertax"]),
+    paste0("(", sprintf("%.3f", pool_se["beertax"]), ")"),
+
+    starify(coef(pool_model)["drinkage"], pool_p["drinkage"]),
+    paste0("(", sprintf("%.3f", pool_se["drinkage"]), ")"),
+
+    starify(coef(pool_model)["log_income"], pool_p["log_income"]),
+    paste0("(", sprintf("%.3f", pool_se["log_income"]), ")"),
+
+    starify(coef(pool_model)["log_miles"], pool_p["log_miles"]),
+    paste0("(", sprintf("%.3f", pool_se["log_miles"]), ")"),
+
+    starify(coef(pool_model)["log_pop"], pool_p["log_pop"]),
+    paste0("(", sprintf("%.3f", pool_se["log_pop"]), ")"),
+
+    starify(coef(pool_model)["(Intercept)"], pool_p["(Intercept)"]),
+    paste0("(", sprintf("%.3f", pool_se["(Intercept)"]), ")"),
+
+    sprintf("%.3f", summary(pool_model)$r.squared[1]),
+    "No",
+    "No"
+  ),
+
+  `Fixed Effects` = c(
+    starify(coef(fe_model)["beertax"], fe_p["beertax"]),
+    paste0("(", sprintf("%.3f", fe_se["beertax"]), ")"),
+
+    starify(coef(fe_model)["drinkage"], fe_p["drinkage"]),
+    paste0("(", sprintf("%.3f", fe_se["drinkage"]), ")"),
+
+    starify(coef(fe_model)["log_income"], fe_p["log_income"]),
+    paste0("(", sprintf("%.3f", fe_se["log_income"]), ")"),
+
+    starify(coef(fe_model)["log_miles"], fe_p["log_miles"]),
+    paste0("(", sprintf("%.3f", fe_se["log_miles"]), ")"),
+
+    starify(coef(fe_model)["log_pop"], fe_p["log_pop"]),
+    paste0("(", sprintf("%.3f", fe_se["log_pop"]), ")"),
+
+    "",
+    "",
+
+    sprintf("%.3f", summary(fe_model)$r.squared[1]),
+    "Yes",
+    "No"
+  ),
+
+  `Random Effects` = c(
+    starify(coef(re_model)["beertax"], re_p["beertax"]),
+    paste0("(", sprintf("%.3f", re_se["beertax"]), ")"),
+
+    starify(coef(re_model)["drinkage"], re_p["drinkage"]),
+    paste0("(", sprintf("%.3f", re_se["drinkage"]), ")"),
+
+    starify(coef(re_model)["log_income"], re_p["log_income"]),
+    paste0("(", sprintf("%.3f", re_se["log_income"]), ")"),
+
+    starify(coef(re_model)["log_miles"], re_p["log_miles"]),
+    paste0("(", sprintf("%.3f", re_se["log_miles"]), ")"),
+
+    starify(coef(re_model)["log_pop"], re_p["log_pop"]),
+    paste0("(", sprintf("%.3f", re_se["log_pop"]), ")"),
+
+    starify(coef(re_model)["(Intercept)"], re_p["(Intercept)"]),
+    paste0("(", sprintf("%.3f", re_se["(Intercept)"]), ")"),
+
+    sprintf("%.3f", summary(re_model)$r.squared[1]),
+    "No",
+    "Yes"
+  )
+)
+
+# Add assumptions row
+comparison_table <- rbind(
+  comparison_table,
+  c(
+    "Assumptions",
+    "No state-specific effects (ignored)",
+    "Cov($a_i$, $X_{it}$) unrestricted",
+    "Cov($a_i$, $X_{it}$) = 0"
+  )
+)
+
+kable( comparison_table, caption = "Comparison of Panel Data Models", align = c("l", "c", "c", "c"), escape = FALSE )
+```
+
+
+
+## Selection and Diagnostics
+
+### Model Selection
+
+```{r selection-tests}
+# F test for individual fixed effects to see if fixed effects model is needed, or if pooled model is sufficient.
+individual_ftest <- pFtest(fe_model, pool_model)
+
+# LM test to see if there is meaningful individual heterogeneity to justify using the random effects model, rather than pooled OLS. 
+individual_lmtest <- plmtest(pool_model, effect = "individual", type = "bp")
+
+# Hausman test to choose between FEM and REM.
+hausman_test <- phtest(fe_model, re_model)
+
+# Table to show test results.
+model_tests <- data.frame(
+  Test = c(
+    "F-test (Pooled vs. State Fixed Effects)",
+    "LM-test (Pooled vs. Random Effects)",
+    "Hausman test (Fixed Effects vs. Random Effects)"
+  ),
+  Statistic = c(
+    as.numeric(individual_ftest$statistic),
+    as.numeric(individual_lmtest$statistic),
+    as.numeric(hausman_test$statistic)
+  ),
+  'p-value' = c(
+    as.numeric(individual_ftest$p.value),
+    as.numeric(individual_lmtest$p.value),
+    as.numeric(hausman_test$p.value)
+  )
+)
+
+
+model_tests$p.value <- formatC(
+  model_tests$p.value,
+  format = "e",
+  digits = 3
+)
+
+kable(
+  model_tests,
+  digits = 4,
+  caption = "Model Selection Tests"
+)
+```
+
+To determine which model to select for our panel data, we use the sequence of formal tests discussed during lecture. We want to ask whether the simple pooled OLS model is sufficient, or whether individual (state) heterogeneity should be model using either fixed effects or random effects models.
+
+
+First, we conducted an F-test using `pFtest` to compare the pooled OLS model to the fixed effects model. The null is that state fixed effects aren't necessary, while the alternative hypothesis is that at least one state intercept differs, meaning there is significant unobserved heterogeneity across individuals:
+\[
+H_0: \beta_1 = \beta_2 = ... = \beta_k, \ H_1: \text{not all } \beta_i \text{ are equal}
+\]
+After running this test, we noticed that for our individual fixed effects model, the F-test rejects the pooled OLS model, suggesting that traffic fatality rates differ across states for reasons past the included regressors. 
+
+Next, we ran the LM test using `plmtest` to compare pooled OLS against the random effects model. The null is that the variance of the individual-specific random effect is zero, while the alternative is that there is meaningful state-level random effect:
+\[
+H_0: \sigma^2_a = 0, \ H_1: \sigma^2_a > 0
+\]
+We reject the null for the LM test, indicating that there is statistically significant state-level heterogeneity. We can conclude from the F-test and LM test that pooled OLS is NOT our preferred model specification.
+
+
+Because we reject the pooled model, our final model specification decision is to choose between FEM and REM; we use the Hausman test for this decision. The null is that the REM estimator is consistent; i.e., there is no correlation between the state effect and the regressors. The alternative hypothesis is that the unobserved state effect is correlated with at least one regressor:
+\[
+H_0: Cov(a_i, X_{it}) = 0, \ H_1: Cov(a_i, X_{it}) \neq 0
+\]
+We reject the null for our data set's Hausman test, indicating we prefer the fixed effects model over the random effects model. 
+
+
+Looking at the coefficients estimated in the previous sections, we can also come to the same conclusion; both the pooled OLS and the REM models produced positive coefficients for beer tax, while the FEM model produced a negative coefficient for the same regressor. This difference could suggest that individual-level (between) differences are confounding the ACTUAL relationship between beer taxes and fatalities. To correct for this, the FEM compares each state to its own average over time.
+
+### Diagnostics and Correction
+
+
+```{r diagnostics}
+fe_bg_test <- pbgtest(fe_model)
+fe_dw_test <- pdwtest(fe_model)
+fe_bp_test <- bptest(fe_model)
+
+fe_diagnostic_table <- data.frame(
+  Diagnostic = c(
+    "BG test (Serial correlation)",
+    "DW test (Serial correlation)",
+    "BP test (Heteroskedasticity)"
+  ),
+  Statistic = c(
+    as.numeric(fe_bg_test$statistic),
+    as.numeric(fe_dw_test$statistic),
+    as.numeric(fe_bp_test$statistic)
+  ),
+  'p-value' = c(
+    as.numeric(fe_bg_test$p.value),
+    as.numeric(fe_dw_test$p.value),
+    as.numeric(fe_bp_test$p.value)    
+  )
+)
+
+fe_diagnostic_table$p.value <- formatC(
+  fe_diagnostic_table$p.value,
+  format = "e",
+  digits = 3
+)
+
+
+kable(
+  fe_diagnostic_table,
+  digits = 5,
+  caption = "FEM Diagnostics"
+)
+
+fe_robust_se <- coeftest(
+  fe_model,
+  vcov = vcovHC(
+    fe_model,
+    type = "HC1",
+    cluster = "group"
+  )
+)
+
+fe_coefficients <- summary(fe_model)$coefficients
+
+compare_pvalue <- data.frame(
+  Regressor = c("Beer Tax", "Drinking Age", "Log Income", "Log Miles", "Log Population"),
+  `Original FE p-values` = fe_coefficients[, "Pr(>|t|)"],
+  `Cluster-Robust p-values` = fe_robust_se[, "Pr(>|t|)"],
+  check.names = FALSE
+)
+
+
+
+kable(
+  compare_pvalue,
+  digits = 5,
+  caption = "Original vs. Robust SE P-value comparison"
+)
+
+```
+
+After selecting the FEM for our panel data set, we performed three diagnostic tests: BG and DW for serial correlation, and BP test for heteroskedasticity. Since the p-values for the BG and DW tests are below the standard $\alpha = 0.05$, we reject the null of no serial correlation. This makes sense in the context of our data because unobserved factors that affect fatalities in a single year (e.g. law enforcement and general road safety) could affect fatalities in later years. In addition, we also reject the null of the BP test, indicating that the variance of the residuals is not constant across observations. In the context of our model, this likely means that some observations (state + year) have more volatility in the unexplained portion of fatality rates than others. Because of the result of our diagnostics, it is implied that the original FEM standard errors are not reliable. To correct for this, we can use state-clustered robust standard errors -- note that this correction only fixes standard errors for inference, not the estimates themselves. Since our panel data follows the same states over time, clustering by state allows errors to be correlated within each state across years.
+
+As shown from the p-value comparison table above, we can see that the SE correction creates a material difference. For example, the coefficient next to $beertax$ was around 0.096, which would be significant at $\alpha = 0.10$. However, after applying robust standard errors, the p-value increases to around 0.302. Therefore, although the direction and magnitude of that coefficient remains the same, it is no longer statistically significant at most conventional levels. We note that the only statistically significant variable at that $\alpha = 0.05$ level is $log\_income$. 
+
+
+## Interpretation and Implications
+### Intepreting Coefficients and Results
+
+Our preferred model is the fixed effects model (FEM) as shown through rejection of pooled OLS and the random effects model in our selection tests. This suggests that unobserved state characteristics are significant and are likely correlated with the regressors in some way. Because we use the FEM, the model estimates should be interpreted as within-state relationships. 
+
+
+Our main coefficient of interest is the coefficient in front of $BeerTax$, which we label as $\beta_1$. In the FEM, the estimated coefficient is around -0.314. This means that, holding the controls and time-invariant state effects fixed, a one-unit increase in beer tax is associated with an average decrease of 0.314 traffic fatalities per 10,000 individuals, relative to that state's own average. This negative sign is consistent with our original expectation that beer taxes and fatality rates have an inverse relationship, because the taxes are expected to discourage alcohol consumption and drunk driving.
+
+
+It is important to note that the statistical significant of this estimate changes after correcting the standard errors -- we implemented clustered robust standard errors after concluding that there was significant heteroskedasticity and serial correlation. Using the original standard errors, $\beta_1$ had a p-value of around 0.096, which is significant at the 10% level. After standard error correction, the p-value increases to approximately 0.302, implying that the relationship between beer taxes and fatality rate is not statistically significant at most levels; we cannot conclude that the effect of beer taxes is statistically different from zero.
+
+In addition to beer taxes, the drinking age coefficient ($\beta_2$) is also negative in our FEM, suggesting that increasing the minimum legal drinking age is associated with lower fatality rates. However, we must approach with the same caution as $\beta_1$ -- the p-value after standard error correction is 0.119, which is not statistically significant at most levels. Although this relationship may help to make a claim about drinking age policy, we may want to take the general magnitude of the coefficient into account, rather than using the value for a precise policy prediction.
+
+
+### Policy and Decisionmaking
+
+Looking at the results from a policy perspective, the results are not completely definitive, but can be relevant. The negative coefficient on $BeerTax$ suggests that taxing alcohol could be a useful tool for public safety, but we most likely cannot use this evidence by itself to recommend tax increases because of the lack of statistical significance after adjusting standard errors. Rather, policymakers should use these results alongside additional research and analysis to come to a final conclusion. For example, although a beer tax may reduce alcohol-related fatalities, it could also place financial burden on households, cause substitution toward other beverages, and incentivize purchasing from other states. Despit this, the magnitude of the estimate $\beta_1 = -0.314$ is still economically meaningful. For a state like California with almost 40 million residents, this would correspond to approximately $0.314 \cdot (40,000,000/10,000) = 1,256$ fewer fatalities relative to its own average fatality level.
+
+
+Our findings can also inform individual behavior and business strategy. Our data shows meaningful variation in beer taxes across states and years (although within-state changes over time are more limited), implying that alcohol distributors and sellers operate in various different tax environments depending on location. Higher beer taxes can affect demand for businesses such as bars, restaurants, gas stations, and grocery stores, especially if customers are sensitive to prices. These retailers and restaurants must then face a decision on whether to pass the tax increase onto the consumers, or absorb part of the expense and deal with lower margins. These sellers may also choose to diversify their selection away from beer and toward non-alcoholic drinks, foods, or lower-cost alcohol beverages. These results may also be important for insurance companies; our model can provide evidence of factors that are associated with more dangerous driving environments. For example, insurers may consider policy variables such as our $BeerTax$ regressor when analyzing expected losses across states. If higher beer taxes are associated with a lower average fatality rate, insurance firms may want to support these policies as a lower rate of vehicle incidents would decrease costs of claims.
+
+
+
+### Threats to Identification
+
+One threat to identification in our model specification is reverse causality. Our current model assumes that beer taxes affect traffic fatalities, but it is also possible that traffic fatalities affect beer tax policies. For example, if there is a significant increase in deaths due to drunk driving in a state, policymakers may decide to raise beer taxes. This would not make beer taxes purely exogenous, possibly biasing the estimated beer tax coefficient and weakening causal interpretation.
+
+
+Another threat is measurement error. The $BeerTax$ variable may not capture the actual price of alcohol that is faced by consumers at stores and restaurants; this is important because in reality, consumers respond most directly to final prices. It is possible that retailers may choose to absorb most of the tax such that the final price of the good doesn't increase by a lot. In addition, if the price of beer does indeed increase significantly, consumers may choose to substitute to a different alcoholic beverage (e.g. wine, liquor), which may then continue lead to fatalities. If the $BeerTax$ variable imperfectly measures the actual cost of alcohol to consumers, the estimated relationship between taxes and fatalities may be inaccurate.
+
+
+Finally, omitted variable bias may also be another threat to identification. Although the fixed effects model controls for unobserved time-invariant state characteristics, it does not eliminate all OVB -- time-varying omitted variables may be a concern. For example, suppose a state introduces a beer tax in a certain year, while also increasing investment into DUI checkpoints and seatbelt laws. As a result of this, fatalities fall. In our FEM, this may be estimated as a negative beer tax effect, but part of that reduction may also come from the increased enforcement, such that $Cov(BeerTax_{it}, Enforcement_{it}) \neq 0$. Because DUI checkpoints/enforcement is omitted and changes over time, it remains inside the idiosyncratic portion of the error: $u_{it}$, causing $Cov(BeerTax_{it}, u_{it}) \neq 0$ and creating omitted variable bias, even in the fixed effects model.
+
+
+We could strengthen causal inference by using a natural experiment. We would want to find a state that experienced an increase in beer taxes for non-traffic related reasons; this could be due to deficits causing an increased need for tax revenue, a change in tax law, or inflation adjustments. Finding a change in beer taxes that is not driven by traffic fatalities would make the variable close to an exogenous shock, allowing us to isolate the effect of beer taxes on traffic fatalities. We could then use a differences-in-differences model, where the treatment group is the state(s) that experienced the increased beer taxes, and the control group is a similar state that did not observe a beer tax increase during the same period. If fatalities fall more in the treatment group than in comparable control states, the DiD estimator would give strong evidence that increased beer taxes cause a decline in traffic fatalities. One important assumption in this method is the parallel trends assumption, which says that, without the beer tax change, treatment and control states would have followed similar trends in traffic fatalities. 
+
+
